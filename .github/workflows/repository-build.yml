@@ -1,0 +1,124 @@
+name: Repository build handoff
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Private source tag to build
+        required: true
+        default: v0.8.24
+        type: string
+env:
+  RELEASE_TAG: ${{ inputs.release_tag }}
+permissions:
+  contents: read
+concurrency:
+  group: desktop-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: StarLxc3/Sentire-Connection
+          ref: ${{ inputs.release_tag }}
+          ssh-key: ${{ secrets.RELEASE_SOURCE_SSH_KEY }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.23.2'
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python3 -m pip install -r scripts/requirements-qiniu.txt
+      - run: npm run test:storage
+      - run: npm run build
+  package:
+    if: github.event_name == 'workflow_dispatch'
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: ubuntu-24.04, platform: linux, arch: x64}
+          - {os: windows-2025, platform: windows, arch: x64}
+          - {os: macos-15, platform: macos, arch: arm64}
+          - {os: macos-15-intel, platform: macos, arch: x64}
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    env:
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: StarLxc3/Sentire-Connection
+          ref: ${{ inputs.release_tag }}
+          ssh-key: ${{ secrets.RELEASE_SOURCE_SSH_KEY }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.23.2'
+          cache: npm
+      - run: npm ci
+      - name: Build native desktop package
+        run: node scripts/build-desktop.mjs ${{ matrix.platform }} ${{ matrix.arch }}
+      - name: Upload verified installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-${{ matrix.platform }}-${{ matrix.arch }}
+          path: |
+            releases/desktop-${{ matrix.platform }}-${{ matrix.arch }}/*.exe
+            releases/desktop-${{ matrix.platform }}-${{ matrix.arch }}/*.deb
+            releases/desktop-${{ matrix.platform }}-${{ matrix.arch }}/*.dmg
+            releases/desktop-${{ matrix.platform }}-${{ matrix.arch }}/*.zip
+            releases/desktop-${{ matrix.platform }}-${{ matrix.arch }}/verification.json
+          if-no-files-found: error
+          retention-days: 14
+  publish:
+    if: inputs.release_tag != ''
+    needs: package
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: StarLxc3/Sentire-Connection
+          ref: ${{ inputs.release_tag }}
+          ssh-key: ${{ secrets.RELEASE_SOURCE_SSH_KEY }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.23.2'
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: desktop-*
+          path: releases/ci
+      - name: Assemble one release and website
+        run: |
+          node scripts/assemble-desktop-release.mjs releases/ci releases/publish
+          node scripts/build-website.mjs --manifest releases/publish/release.json
+          tar -czf releases/publish/Sentire-Connect-Website-${RELEASE_TAG}.tar.gz -C releases/website --exclude=files .
+          cd releases/publish
+          sha256sum *.exe *.deb *.dmg *.zip *.tar.gz > SHA256SUMS.txt
+      # Public distribution is performed by scripts/publish-qiniu.py after verification.
+      # Actions artifacts are build handoff only; no GitHub Releases are created.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: repository-release
+          path: releases/publish
+          if-no-files-found: error
+          retention-days: 14
+      - uses: actions/upload-artifact@v4
+        with:
+          name: website-release
+          path: releases/website
